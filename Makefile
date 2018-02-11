@@ -5,4 +5,4 @@ all:
 clean:
 	make -C /lib/modules/$(KVERSION)/build M=$(PWD) clean
 install:
-	/bin/cp -f fingervu.ko /lib/modules/$(KVERSION)/extra/ && depmod -a
+	/bin/mkdir -p /lib/modules/$(KVERSION)/extra/ && /bin/cp -f fingervu.ko /lib/modules/$(KVERSION)/extra/ && depmod -a && sync
