@@ -24,7 +24,7 @@
 #include <linux/hid.h>
 #include <linux/timer.h>
 
-#define DRIVER_VERSION "v0.2"
+#define DRIVER_VERSION "v0.3"
 #define DRIVER_AUTHOR  "Wolfgang Astleitner (mrwastl@users.sourceforge.net)"
 #define DRIVER_DESC    "SoundGraph FingerVU touch and IR/Keys/RC driver"
 #define DRIVER_NAME    "fingervu"
@@ -32,25 +32,33 @@
 /* to prevent races between open() and disconnect(), probing, etc */
 static DEFINE_MUTEX(driver_lock);
 
-static bool debug;
+static bool debug = 0;
 module_param(debug, bool, 0644);
 MODULE_PARM_DESC(debug, "Debug messages: 0=no, 1=yes (default: no)");
 
-static bool mirror_x;
+static bool mirror_x = 0;
 module_param(mirror_x, bool, 0644);
 MODULE_PARM_DESC(mirror_x, "Mirror X axis: 0=no, 1=yes (default: no)");
 
-static bool mirror_y;
+static bool mirror_y = 0;
 module_param(mirror_y, bool, 0644);
 MODULE_PARM_DESC(mirror_y, "Mirror Y axis: 0=no, 1=yes (default: no)");
 
-static bool disable_touch;
+static bool disable_touch = 0;
 module_param(disable_touch, bool, 0644);
 MODULE_PARM_DESC(disable_touch, "Disable touchscreen: 0=no, 1=yes (default: no)");
 
-static bool disable_idev;
+static bool disable_idev = 0;
 module_param(disable_idev, bool, 0644);
 MODULE_PARM_DESC(disable_idev, "Disable input device: 0=no, 1=yes (default: no)");
+
+static unsigned int repeat_delay = 660;
+module_param(repeat_delay, uint, 0644);
+MODULE_PARM_DESC(repeat_delay, "Delay after which a repeated key event will be generated (default: 660ms)");
+
+static unsigned int repeat_rate = 10;
+module_param(repeat_rate, uint, 0644);
+MODULE_PARM_DESC(repeat_rate, "Max. repeats per seconds (default: 10 repeats/s)");
 
 /* table of devices that work with this driver */
 static struct usb_device_id id_table [] = {
@@ -61,6 +69,9 @@ static struct usb_device_id id_table [] = {
   { },
 };
 
+/* internal flags */
+static int flag_warned_urb = 0;
+static int flag_warned_epipe = 0;
 
 /* main driver context */
 /*static*/ struct fingervu_context {
@@ -89,7 +100,12 @@ static struct usb_device_id id_table [] = {
   char name_idev[128];        /* input device name */
   char phys_idev[64];         /* input device phys path */
   struct timer_list ktimer;   /* touch screen timer */
-  u32 key_prev;
+  u32 key_pending;            /* keycode waiting for timer to fire down event */
+  int key_repeated;           /* has current keycode already been repeated at least once ? */
+  struct timespec prev_event; /* timestamp of previous reported key event */
+  u32 prev_key;               /* previous reported key event */
+  u16 repeat_rate_ms;         /* precalculated repeated in min delay between two events in ms ( = 1000ms / repeat_rate ) */
+  
 
   char name_touch[128];       /* touch screen name */
   char phys_touch[64];        /* touch screen phys path */
@@ -104,68 +120,71 @@ static struct usb_device_id id_table [] = {
 static const struct {
   u32 hw_code;
   u32 keycode;
+  unsigned char flags;
 } fingervu_panel_key_table[] = {
   /* 8 byte raw code: XX 00 YY 00 00 00 00 00  */
   /*  0400XXYY                                 */
   /* 64byte raw code: 41 02 ed aX XY Y4 00 ... */
   /*  0800XXYY                                 */
-  { 0x04000028, KEY_ENTER },
-  { 0x0400002a, KEY_EXIT },
-  { 0x04000065, KEY_MENU },
-  { 0x08008891, KEY_POWER },
-  { 0x08009811, KEY_CLOSE },
-  { 0x08008a55, KEY_UP },
-  { 0x08008a91, KEY_DOWN },
-  { 0x08008a59, KEY_LEFT },
-  { 0x08008a5d, KEY_RIGHT },
-  { 0x08009a9d, KEY_MUTE },
-  { 0x08009c51, KEY_VOLUMEUP },
-  { 0x08009a51, KEY_VOLUMEDOWN },
-  { 0x08009c91, KEY_CHANNELUP },
-  { 0x08009e11, KEY_CHANNELDOWN },
-  { 0x08008c19, KEY_PREVIOUS },
-  { 0x08008c1d, KEY_NEXT },
-  { 0x08008c15, KEY_PLAYPAUSE },
-  { 0x080098d5, KEY_PROGRAM },
+  { 0x04000028, KEY_ENTER,       0 },
+  { 0x0400002a, KEY_EXIT,        0 },
+  { 0x04000065, KEY_MENU,        0 },
+  { 0x08008891, KEY_POWER,       0 },
+  { 0x08009811, KEY_CLOSE,       0 },
+  { 0x08008a55, KEY_UP,          0 },
+  { 0x08008a91, KEY_DOWN,        0 },
+  { 0x08008a59, KEY_LEFT,        0 },
+  { 0x08008a5d, KEY_RIGHT,       0 },
+  { 0x08009a9d, KEY_MUTE,        0 },
+  { 0x08009c51, KEY_VOLUMEUP,    1 },
+  { 0x08009a51, KEY_VOLUMEDOWN,  1 },
+  { 0x08009c91, KEY_CHANNELUP,   0 },
+  { 0x08009e11, KEY_CHANNELDOWN, 0 },
+  { 0x08008c19, KEY_PREVIOUS,    0 },
+  { 0x08008c1d, KEY_NEXT,        0 },
+  { 0x08008c15, KEY_PLAYPAUSE,   0 },
+  { 0x080098d5, KEY_PROGRAM,     0 },
 
-  { 0x04000027, KEY_0 },
-  { 0x0400001e, KEY_1 },
-  { 0x0400001f, KEY_2 },
-  { 0x04000020, KEY_3 },
-  { 0x04000021, KEY_4 },
-  { 0x04000022, KEY_5 },
-  { 0x04000023, KEY_6 },
-  { 0x04000024, KEY_7 },
-  { 0x04000025, KEY_8 },
-  { 0x04000026, KEY_9 },
-  { 0x08008a1d, KEY_RED },
-  { 0x08009899, KEY_GREEN },
-  { 0x08008a51, KEY_YELLOW },
-  { 0x0800885d, KEY_BLUE },
-  { 0x08009815, KEY_REWIND },
-  { 0x0800881d, KEY_FORWARD },
-  { 0x08008895, KEY_PAUSE },
-  { 0x08008819, KEY_RECORD },
-  { 0x08008815, KEY_PLAY },
-  { 0x0800889d, KEY_PREVIOUS },
-  { 0x08009819, KEY_NEXT },
-  { 0x08008e9d, KEY_STOP },
-  { 0x080098d9, KEY_EJECTCD },
+  { 0x04000027, KEY_0,           0 },
+  { 0x0400001e, KEY_1,           0 },
+  { 0x0400001f, KEY_2,           0 },
+  { 0x04000020, KEY_3,           0 },
+  { 0x04000021, KEY_4,           0 },
+  { 0x04000022, KEY_5,           0 },
+  { 0x04000023, KEY_6,           0 },
+  { 0x04000024, KEY_7,           0 },
+  { 0x04000025, KEY_8,           0 },
+  { 0x04000026, KEY_9,           0 },
+  { 0x08008a1d, KEY_RED,         0 },
+  { 0x08009899, KEY_GREEN,       0 },
+  { 0x08008a51, KEY_YELLOW,      0 },
+  { 0x0800885d, KEY_BLUE,        0 },
+  { 0x08009815, KEY_REWIND,      0 },
+  { 0x0800881d, KEY_FORWARD,     0 },
+  { 0x08008895, KEY_PAUSE,       0 },
+  { 0x08008819, KEY_RECORD,      0 },
+  { 0x08008815, KEY_PLAY,        0 },
+  { 0x0800889d, KEY_PREVIOUS,    0 },
+  { 0x08009819, KEY_NEXT,        0 },
+  { 0x08008e9d, KEY_STOP,        0 },
+  { 0x080098d9, KEY_EJECTCD,     0 },
   /* knob/panel command: 50 XX YY 00 ... */
-  /*  5000XXYY                           */
-  { 0x5000022a, KEY_VOLUMEDOWN }, /* knob left */
-  { 0x50000228, KEY_VOLUMEUP },   /* knob right */
-  { 0x50000101, KEY_MUTE },       /* knob press */
-  { 0x5000010f, KEY_MEDIA },      /* panel iMedian */
-  { 0x5000012b, KEY_EXIT },       /* panel app exit */
-  { 0x50000117, KEY_ESC },        /* panel esc */
-  { 0x50000112, KEY_UP },         /* panel up */
-  { 0x50000116, KEY_ENTER },      /* panel enter */
-  { 0x5000012c, KEY_SELECT },     /* panel start */
-  { 0x5000012d, KEY_MENU },       /* panel menu */
-  { 0x50000114, KEY_LEFT },       /* panel left */
-  { 0x50000113, KEY_DOWN },       /* panel down */
-  { 0x50000115, KEY_RIGHT },      /* panel right */
+  /*  0500XXYY                           */
+  { 0x0500022a, KEY_VOLUMEDOWN,  1 }, /* knob left */
+  { 0x05000228, KEY_VOLUMEUP,    1 }, /* knob right */
+  { 0x0500020a, KEY_VOLUMEDOWN,  1 }, /* knob left alt */
+  { 0x05000208, KEY_VOLUMEUP,    1 }, /* knob right alt */
+  { 0x05000101, KEY_MUTE,        0 }, /* knob press */
+  { 0x0500010f, KEY_MEDIA,       0 }, /* panel iMedian */
+  { 0x0500012b, KEY_EXIT,        0 }, /* panel app exit */
+  { 0x05000117, KEY_ESC,         0 }, /* panel esc */
+  { 0x05000112, KEY_UP,          0 }, /* panel up */
+  { 0x05000116, KEY_ENTER,       0 }, /* panel enter */
+  { 0x0500012c, KEY_SELECT,      0 }, /* panel start */
+  { 0x0500012d, KEY_MENU,        0 }, /* panel menu */
+  { 0x05000114, KEY_LEFT,        0 }, /* panel left */
+  { 0x05000113, KEY_DOWN,        0 }, /* panel down */
+  { 0x05000115, KEY_RIGHT,       0 }, /* panel right */
 };
 
 #define TOUCH_TIMEOUT (HZ/30)
@@ -178,7 +197,7 @@ static void              fingervu_disconnect(struct usb_interface *interface);
 static struct input_dev* fingervu_init_touch(struct fingervu_context *context);
 static struct input_dev* fingervu_init_idev(struct fingervu_context *context);
 static void              usb_rx_callback(struct urb *urb);
-static u32               find_keycode(u32 scancode);
+static u32               find_keycode(u32 scancode, unsigned char*);
 
 
 
@@ -327,7 +346,6 @@ static void fingervu_disconnect(struct usb_interface *interface) {
 
   if (context->dev_present_intf[ifnum]) {
     context->dev_present_intf[ifnum] = false;
-    usb_kill_urb(context->rx_urb_intf[ifnum]);
 
     if (ep->bEndpointAddress == 0x83) {
       if (context->touch) {
@@ -341,6 +359,7 @@ static void fingervu_disconnect(struct usb_interface *interface) {
         context->idev = NULL;
       }
     }
+    usb_kill_urb(context->rx_urb_intf[ifnum]);
     usb_free_urb(context->rx_urb_intf[ifnum]);
   }
 
@@ -377,23 +396,25 @@ static void fingervu_touch_timeout(unsigned long data) {
 
 static void fingervu_key_timeout(unsigned long data) {
   struct fingervu_context *context = (struct fingervu_context *)data;
-  if (context->idev && context->key_prev != KEY_RESERVED) {
-    input_report_key(context->idev, context->key_prev, 0x00);
+  if (context->idev && context->key_pending != KEY_RESERVED) {
+    input_report_key(context->idev, context->key_pending, 0x00);
     input_sync(context->idev);
-    context->key_prev = KEY_RESERVED;
+    context->key_pending = KEY_RESERVED;
   }
 }
 
 
-static u32 find_keycode(u32 scancode) {
+static u32 find_keycode(u32 scancode, unsigned char* flags) {
   int i = 0;
   int l = ARRAY_SIZE(fingervu_panel_key_table);
   while (i < l) {
     if (fingervu_panel_key_table[i].hw_code == scancode) {
+      *flags = fingervu_panel_key_table[i].flags;
       return fingervu_panel_key_table[i].keycode;
     }
     i++; 
   }
+  *flags = 0;
   return KEY_RESERVED;
 }
 
@@ -492,6 +513,11 @@ static struct input_dev* fingervu_init_idev(struct fingervu_context *context) {
     return NULL;
   }
 
+  context->prev_key = KEY_RESERVED;
+  getnstimeofday(&(context->prev_event));
+  context->repeat_rate_ms = 1000 / repeat_rate;   /* min. delay between two events   in ms */
+  context->key_repeated = 0;
+  
   return idev;
 }
 
@@ -504,11 +530,15 @@ static void fingervu_incoming_packet(struct fingervu_context *context, struct ur
   int len = urb->actual_length;
   unsigned char *buf = urb->transfer_buffer;
   int found = false;
+  int delayok = false;
   u32 keycode = KEY_RESERVED;
   int keytype = 0x01;  /* default: pressed */
-//  unsigned long flags;
+  unsigned char flags;
+  struct timespec curr_time;
+  unsigned long  timediff;
 
-  if (len == 64 && buf[0] == 0x32 && buf[1] == 0xf1) { /* touch event */
+  if (len == 64 && buf[0] == 0x32 && buf[1] == 0xf1) { /* tprintk(KERN_INFO  ".");
+ouch event */
     if (context->touch) {
       mod_timer(&context->ttimer, jiffies + TOUCH_TIMEOUT);
       context->touch_x = (buf[2] << 8) | buf[3];
@@ -532,12 +562,12 @@ static void fingervu_incoming_packet(struct fingervu_context *context, struct ur
       u32 togglemask = 0x00002000;
 
       if (! (scancode & togglemask)) {
-        keycode = find_keycode(scancode);
+        keycode = find_keycode(scancode, &flags);
         found = (keycode != KEY_RESERVED);
       } else {
         /* ignore key up event */
 //        printk(KERN_INFO "T %08x %s %08x\n", context->rdev->last_scancode,(found) ? "==" : "!=", scancode );
-        keycode = find_keycode(scancode);
+        keycode = find_keycode(scancode, &flags);
         keytype = 0x00;
         found = true;
       }
@@ -550,26 +580,58 @@ static void fingervu_incoming_packet(struct fingervu_context *context, struct ur
       if (rawcode == 0x0000) {
         found = true; /* ignore key up event */
       } else {
-        keycode = find_keycode(scancode);
+        keycode = find_keycode(scancode, &flags);
         found = (keycode != KEY_RESERVED);
       }
     }
   } else if (len == 64 && buf[0] == 0x50) { /* knob/panel */
     if (context->idev) {
       u16 rawcode = buf[1] << 8 | buf[2];
-      u32 scancode = 0x50000000 | rawcode;
+      u32 scancode = 0x05000000 | rawcode;
       
-      keycode = find_keycode(scancode);
+      keycode = find_keycode(scancode, &flags);
       found = (keycode != KEY_RESERVED);
     }
   }
 
-  if (found && keycode != KEY_RESERVED) {
+  if (found && keycode != KEY_RESERVED /*&& context->key_pending == KEY_RESERVED*/) {
+    int force_norepeat = 0;
+    
     del_timer(&context->ktimer);
-    input_report_key(context->idev, keycode, keytype);
-    input_sync(context->idev);
-    context->key_prev = keycode;
-    mod_timer(&context->ktimer, jiffies + KEYEV_TIMEOUT);
+    getnstimeofday(&curr_time);
+
+    delayok = 1;
+
+    if ( keycode == context->prev_key ) {
+
+      delayok = 0;
+      timediff = (curr_time.tv_sec - context->prev_event.tv_sec) * 1000 + ((curr_time.tv_nsec - context->prev_event.tv_nsec) / 1000000);  /* diff in ms */
+
+      if (timediff >= (repeat_delay + context->repeat_rate_ms)) { /* same key, but with interruption */
+         force_norepeat = 1;
+      }
+
+      if ( ( context->key_repeated || (flags & 0x01) ) && timediff >= context->repeat_rate_ms) {
+        delayok = 1;
+      } else if (timediff >= repeat_delay) {
+        delayok = 1;
+      }
+    }
+
+    if (delayok) {
+      input_report_key(context->idev, keycode, keytype);
+      input_sync(context->idev);
+      context->key_pending = keycode;
+      mod_timer(&context->ktimer, jiffies + KEYEV_TIMEOUT);
+      context->prev_event.tv_sec = curr_time.tv_sec;
+      context->prev_event.tv_nsec = curr_time.tv_nsec;
+      if ( (!force_norepeat) && (keycode == context->prev_key) ) {
+        context->key_repeated = 1;   /* same keycode repeated at least once */
+      } else {
+        context->prev_key = keycode; /* new keycode */
+        context->key_repeated = 0;
+      }
+    }
     //printk(KERN_INFO "sending keycode %08x\n", keycode);
   }
 
@@ -598,8 +660,10 @@ static void usb_rx_callback(struct urb *urb) {
   }
 
   context = (struct fingervu_context *)urb->context;
-  if (!context)
+  if (!context) {
+    usb_unlink_urb(urb);
     return;
+  }
 
 
   /*
@@ -610,25 +674,36 @@ static void usb_rx_callback(struct urb *urb) {
   if (context->dev_present_intf[ifnum]) {
 
     switch (urb->status) {
-    case -ENOENT:		/* usbcore unlink successful! */
+    case -ECONNRESET:
+    case -ENOENT:
+    case -ESHUTDOWN: /* usbcore unlink successful! */
+      usb_unlink_urb(urb);
       return;
 
     case -EPIPE:	/*  ? */
-      break;
-
-    case -ESHUTDOWN:	/* transport endpoint was shut down */
+      usb_unlink_urb(urb);
+      if (flag_warned_epipe == 0 || flag_warned_epipe >= 100) {
+        flag_warned_epipe = 0;
+        dev_warn(context->dev, "fingervu %s:  -EPIPE occured, next 100 such errors will be ignored\n", __func__);
+      }
+      flag_warned_epipe ++;
       break;
 
     case 0:
       fingervu_incoming_packet(context, urb, ifnum);
+      flag_warned_urb = 0;
+      flag_warned_epipe = 0;
       break;
 
     default:
-      dev_warn(context->dev, "fingervu %s: status(%d): ignored\n", __func__, urb->status);
+      if (!flag_warned_urb) {
+        dev_warn(context->dev, "fingervu %s: status(%d): ignored\n", __func__, urb->status);
+        flag_warned_urb = 1;
+      }
       break;
     }
   }
-  usb_submit_urb(context->rx_urb_intf[ifnum], GFP_ATOMIC);
+  usb_submit_urb(context->rx_urb_intf[ifnum], GFP_KERNEL /*GFP_ATOMIC*/);
 }
 
 
