@@ -24,7 +24,7 @@
 #include <linux/hid.h>
 #include <linux/timer.h>
 
-#define DRIVER_VERSION "v0.4"
+#define DRIVER_VERSION "v0.5"
 #define DRIVER_AUTHOR  "Wolfgang Astleitner (mrwastl@users.sourceforge.net)"
 #define DRIVER_DESC    "SoundGraph FingerVU touch and IR/Keys/RC driver"
 #define DRIVER_NAME    "fingervu"
@@ -52,6 +52,10 @@ static bool disable_idev = 0;
 module_param(disable_idev, bool, 0644);
 MODULE_PARM_DESC(disable_idev, "Disable input device: 0=no, 1=yes (default: no)");
 
+static bool disable_mouse = 1;
+module_param(disable_mouse, bool, 0644);
+MODULE_PARM_DESC(disable_mouse, "Disable mouse device: 0=no, 1=yes (default: no)");
+
 static unsigned int repeat_delay = 660;
 module_param(repeat_delay, uint, 0644);
 MODULE_PARM_DESC(repeat_delay, "Delay after which a repeated key event will be generated (default: 660ms)");
@@ -69,9 +73,22 @@ static struct usb_device_id id_table [] = {
   { },
 };
 
+
 /* internal flags */
 static int flag_warned_urb = 0;
 static int flag_warned_epipe = 0;
+
+/* mouse support for iMON Pad remote control
+ * 
+ * the state of the mouse support can
+ * be toggled using the 'Mouse/Keyboard Button':
+ * 1: pad control plus 'Mouse Left/Right Click Buttons' act as a mouse device
+ * 0: pad control acts as keyboard 4 way keys
+ * 
+ * if mouse support is disabled by parameter 'disable_mouse', this flag will
+ * always be 0
+ */ 
+static int flag_disablemouse = 0;
 
 /* main driver context */
 /*static*/ struct fingervu_context {
@@ -116,6 +133,7 @@ static int flag_warned_epipe = 0;
 };
 
 
+
 /* imon receiver front panel/knob key table */
 static const struct {
   u32 hw_code;
@@ -123,70 +141,104 @@ static const struct {
   unsigned char flags;
 } fingervu_panel_key_table[] = {
   /* 8 byte raw code: XX 00 YY 00 00 00 00 00  */
-  /*  0400XXYY                                 */
+  /*  04F0XXYY  (F .. flags)                   */
   /* 64byte raw code: 41 02 ed aX XY Y4 00 ... */
-  /*  0800XXYY                                 */
-  { 0x04000028, KEY_ENTER,       0 },
-  { 0x0400002a, KEY_EXIT,        0 },
-  { 0x04000065, KEY_MENU,        0 },
-  { 0x08008891, KEY_POWER,       0 },
-  { 0x08009811, KEY_CLOSE,       0 },
-  { 0x08008a55, KEY_UP,          0 },
-  { 0x08008a91, KEY_DOWN,        0 },
-  { 0x08008a59, KEY_LEFT,        0 },
-  { 0x08008a5d, KEY_RIGHT,       0 },
-  { 0x08009a9d, KEY_MUTE,        0 },
-  { 0x08009c51, KEY_VOLUMEUP,    1 },
-  { 0x08009a51, KEY_VOLUMEDOWN,  1 },
-  { 0x08009c91, KEY_CHANNELUP,   0 },
-  { 0x08009e11, KEY_CHANNELDOWN, 0 },
-  { 0x08008c19, KEY_PREVIOUS,    0 },
-  { 0x08008c1d, KEY_NEXT,        0 },
-  { 0x08008c15, KEY_PLAYPAUSE,   0 },
-  { 0x080098d5, KEY_PROGRAM,     0 },
+  /*  08F0XXYY  (F .. flags)                   */
+  { 0x04000028, KEY_ENTER,           0 },
+  { 0x0400002a, KEY_BACKSPACE,       0 }, /* backspace / <- */
+  { 0x04000065, KEY_MENU,            0 },
+  { 0x08008891, KEY_POWER,           0 }, /* power */
+  { 0x08009811, KEY_CLOSE,           0 }, /* app exit */
+  { 0x08008a55, KEY_UP,              0 },
+  { 0x08008a91, KEY_DOWN,            0 },
+  { 0x08008a59, KEY_LEFT,            0 },
+  { 0x08008a5d, KEY_RIGHT,           0 },
+  { 0x08009a9d, KEY_MUTE,            0 },
+  { 0x08009c51, KEY_VOLUMEUP,        1 },
+  { 0x08009a51, KEY_VOLUMEDOWN,      1 },
+  { 0x08009c91, KEY_CHANNELUP,       0 },
+  { 0x08009e11, KEY_CHANNELDOWN,     0 },
+  { 0x08008c19, KEY_PREVIOUS,        0 },
+  { 0x08008c1d, KEY_NEXT,            0 },
+  { 0x08008c15, KEY_PLAYPAUSE,       0 },
+  { 0x080098d5, KEY_PROGRAM,         0 }, /* quick launch */
 
-  { 0x04000027, KEY_0,           0 },
-  { 0x0400001e, KEY_1,           0 },
-  { 0x0400001f, KEY_2,           0 },
-  { 0x04000020, KEY_3,           0 },
-  { 0x04000021, KEY_4,           0 },
-  { 0x04000022, KEY_5,           0 },
-  { 0x04000023, KEY_6,           0 },
-  { 0x04000024, KEY_7,           0 },
-  { 0x04000025, KEY_8,           0 },
-  { 0x04000026, KEY_9,           0 },
-  { 0x08008a1d, KEY_RED,         0 },
-  { 0x08009899, KEY_GREEN,       0 },
-  { 0x08008a51, KEY_YELLOW,      0 },
-  { 0x0800885d, KEY_BLUE,        0 },
-  { 0x08009815, KEY_REWIND,      0 },
-  { 0x0800881d, KEY_FORWARD,     0 },
-  { 0x08008895, KEY_PAUSE,       0 },
-  { 0x08008819, KEY_RECORD,      0 },
-  { 0x08008815, KEY_PLAY,        0 },
-  { 0x0800889d, KEY_PREVIOUS,    0 },
-  { 0x08009819, KEY_NEXT,        0 },
-  { 0x08008e9d, KEY_STOP,        0 },
-  { 0x080098d9, KEY_EJECTCD,     0 },
-  /* knob/panel command: 50 XX YY 00 ... */
-  /*  0500XXYY                           */
-  { 0x05000202, KEY_VOLUMEDOWN,  1 }, /* knob left, YY =>   0x02 */
-  { 0x05000200, KEY_VOLUMEUP,    1 }, /* knob right YY => ! 0x02*/
-  { 0x05000101, KEY_MUTE,        0 }, /* knob press */
-  { 0x0500010f, KEY_MEDIA,       0 }, /* panel iMedian */
-  { 0x0500012b, KEY_EXIT,        0 }, /* panel app exit */
-  { 0x05000117, KEY_ESC,         0 }, /* panel esc */
-  { 0x05000112, KEY_UP,          0 }, /* panel up */
-  { 0x05000116, KEY_ENTER,       0 }, /* panel enter */
-  { 0x0500012c, KEY_SELECT,      0 }, /* panel start */
-  { 0x0500012d, KEY_MENU,        0 }, /* panel menu */
-  { 0x05000114, KEY_LEFT,        0 }, /* panel left */
-  { 0x05000113, KEY_DOWN,        0 }, /* panel down */
-  { 0x05000115, KEY_RIGHT,       0 }, /* panel right */
+  { 0x08009815, KEY_REWIND,          0 }, /* << */
+  { 0x0800881d, KEY_FORWARD,         0 }, /* >> */
+  { 0x08008895, KEY_PAUSE,           0 }, /* || */
+  { 0x08008819, KEY_RECORD,          0 }, /* record button */
+  { 0x08008815, KEY_PLAY,            0 }, /* play button */
+  { 0x0800889d, KEY_PREVIOUS,        0 }, /* |< */
+  { 0x08009819, KEY_NEXT,            0 }, /* >| */
+  { 0x08008e9d, KEY_STOP,            0 }, /* stop button */
+  { 0x080098d9, KEY_OPEN,            0 }, /* ^ */
+  { 0x08008899, KEY_TOUCHPAD_TOGGLE, 0 }, /* mouse/keyboard toggle (only if disable_mouse == 1) */
+  { 0x08308899, KEY_TOUCHPAD_ON,     0 }, /* mouse/keyboard toggle, enable mouse support (only if disable_mouse == 0) */
+  { 0x08208899, KEY_TOUCHPAD_OFF,    0 }, /* mouse/keyboard toggle, enable 4 way keys support (only if disable_mouse == 0) */
+  { 0x04000800, BTN_START,           0 }, /* windows start */
+  { 0x0400002c, KEY_SELECT,          0 }, /* select/space */
+  { 0x04000029, KEY_ESC,             0 }, /* esc/clear */
+  { 0x08009c99, KEY_EJECTCD,         0 }, /* eject */
+  { 0x08008ed9, KEY_PROG1,           0 }, /* app launcher */
+  { 0x08009c95, BTN_TASK,            0 }, /* task switcher */
+  { 0x08009c1d, KEY_TIME,            0 }, /* timer */
+  { 0x04000027, KEY_0,               0 },
+  { 0x0400001e, KEY_1,               0 },
+  { 0x0400001f, KEY_2,               0 },
+  { 0x04000020, KEY_3,               0 },
+  { 0x04000021, KEY_4,               0 },
+  { 0x04000022, KEY_5,               0 },
+  { 0x04000023, KEY_6,               0 },
+  { 0x04000024, KEY_7,               0 },
+  { 0x04000025, KEY_8,               0 },
+  { 0x04000026, KEY_9,               0 },
+  { 0x04002025, KEY_NUMERIC_STAR,    0 }, /* * */
+  { 0x04002020, KEY_NUMERIC_POUND,   0 }, /* # */
+  { 0x08008a1d, KEY_RED,             0 },
+  { 0x08009899, KEY_GREEN,           0 },
+  { 0x08008a51, KEY_YELLOW,          0 },
+  { 0x0800885d, KEY_BLUE,            0 },
+  { 0x08008a11, KEY_BOOKMARKS,       0 }, /* bookmarks */
+  { 0x08008ed5, BTN_THUMB,           0 }, /* thumbnail */
+  { 0x08009a59, KEY_ZOOM,            0 }, /* zoom */
+  { 0x08009c55, KEY_SCREEN,          0 }, /* full screen */
+  { 0x08009c59, KEY_DVD,             0 }, /* dvd */
+  { 0x08009c5d, KEY_TITLE,           0 }, /* dvd menu */
+  { 0x08009a19, KEY_SUBTITLE,        0 }, /* subtitle */
+  { 0x08009a1d, KEY_AUDIO,           0 }, /* audio */
+  /* knob/panel command: 50 XX YY 00 ...       */
+  /*  05F0XXYY  (F .. flags)                   */
+  { 0x05000202, KEY_VOLUMEDOWN,      1 }, /* knob left, YY =>   0x02 */
+  { 0x05000200, KEY_VOLUMEUP,        1 }, /* knob right YY => ! 0x02*/
+  { 0x05000101, KEY_MUTE,            0 }, /* knob press */
+  { 0x0500010f, KEY_MEDIA,           0 }, /* panel iMedian */
+  { 0x0500012b, KEY_EXIT,            0 }, /* panel app exit */
+  { 0x05000117, KEY_BACKSPACE,       0 }, /* panel back */
+  { 0x05000112, KEY_UP,              0 }, /* panel up */
+  { 0x05000116, KEY_ENTER,           0 }, /* panel enter */
+  { 0x0500012c, BTN_START,           0 }, /* panel start */
+  { 0x0500012d, KEY_MENU,            0 }, /* panel menu */
+  { 0x05000114, KEY_LEFT,            0 }, /* panel left */
+  { 0x05000113, KEY_DOWN,            0 }, /* panel down */
+  { 0x05000115, KEY_RIGHT,           0 }, /* panel right */
+  /* 4 byte raw code: 0X YY XX 00              */
+  /*  01FXYYZZ  (F .. flags)                   */
+  /* NB: only active if parameter 'disable_mouse' == 1 or flag_disablemouse == 1 */
+  { 0x01010000, BTN_LEFT,            0 }, /* mouse button left */
+  { 0x01020000, BTN_RIGHT,           0 }, /* mouse button right */
+  { 0x0100F100, KEY_LEFT,            1 }, /* 4 way left */
+  { 0x01000E00, KEY_RIGHT,           1 }, /* 4 way right */
+  { 0x010000F1, KEY_UP,              1 }, /* 4 way up */
+  { 0x0100000E, KEY_DOWN,            1 }, /* 4 way down */
 };
 
 #define TOUCH_TIMEOUT (HZ/30)
 #define KEYEV_TIMEOUT (HZ/30)
+
+
+#define fv_ep2ifnum(_ep) ( ((_ep) == 0x83) ? 2 : ( ((_ep) == 0x82) ? 1 : 0) )
+
+#define fv_ep2pktsize(_ep) ( ((_ep) == 0x83) ? 64 : ( ((_ep) == 0x82) ? 8 : 4) )
 
 
 /* function prototypes */
@@ -288,7 +340,7 @@ static int fingervu_probe(struct usb_interface *interface, const struct usb_devi
         context->rx_urb_intf[ifnum],
         context->usbdev_intf[ifnum],
         usb_rcvintpipe( context->usbdev_intf[ifnum], context->rx_endpoint_intf[ifnum]->bEndpointAddress),
-        context->usb_rx_buf, ((ep->bEndpointAddress == 0x83) ? sizeof(context->usb_rx_buf) : 8),
+        context->usb_rx_buf, fv_ep2pktsize(ep->bEndpointAddress),
         usb_rx_callback,
         context,
         context->rx_endpoint_intf[ifnum]->bInterval
@@ -520,7 +572,6 @@ static struct input_dev* fingervu_init_idev(struct fingervu_context *context) {
 }
 
 
-
 /**
  * Process the incoming packet
  */
@@ -570,7 +621,7 @@ ouch event */
         found = true;
       }
     }
-  } else if (len == 8 && buf[0] == 0 && buf[1] == 0) { /* event from interface 1 */
+  } else if (len == 8 && buf[1] == 0 && buf[3] == 0) { /* event from interface 1 */
     if (context->idev) {
       u16 rawcode = (buf[0] << 8) | buf[2];
       u32 scancode = 0x04000000 | rawcode;
@@ -594,6 +645,29 @@ ouch event */
 
       keycode = find_keycode(scancode, &flags);
       found = (keycode != KEY_RESERVED);
+    }
+  } else if (len == 4) { /* iMON pad mouse */
+    if (disable_mouse || flag_disablemouse) {
+      if (context->idev) {
+        int ignore = 0;
+        u32 scancode = 0x01000000;
+
+        if (buf[0]) {
+          scancode |= (buf[0] << 16);
+        } else {
+          if (buf[1] == 0xF1 || buf[1] == 0x0E) {
+            scancode |= (buf[1] << 8);
+          } else if (buf[2] == 0xF1 || buf[2] == 0x0E) {
+            scancode |= buf[2];
+          } else {
+            ignore = 1;
+          }
+        }
+
+        keycode = find_keycode(scancode, &flags);
+        found = (keycode != KEY_RESERVED) || ignore;
+      }
+    } else {
     }
   }
 
@@ -653,7 +727,7 @@ ouch event */
 static void usb_rx_callback(struct urb *urb) {
   struct fingervu_context *context;
   struct usb_endpoint_descriptor *ep = (struct usb_endpoint_descriptor *)urb->ep;
-  int ifnum = (ep->bEndpointAddress == 0x82) ? 1 : 2;
+  int ifnum = fv_ep2ifnum(ep->bEndpointAddress);
 
   if (!urb) {
     if (debug) {
@@ -739,12 +813,12 @@ static int fingervu_resume(struct usb_interface *interface) {
     usb_fill_int_urb(
       context->rx_urb_intf[ifnum], context->usbdev_intf[ifnum],
       usb_rcvintpipe(context->usbdev_intf[ifnum], context->rx_endpoint_intf[ifnum]->bEndpointAddress),
-      context->usb_rx_buf, ((ep->bEndpointAddress == 0x83) ? sizeof(context->usb_rx_buf) : 8),
+      context->usb_rx_buf, fv_ep2pktsize(ep->bEndpointAddress),
       usb_rx_callback,
       context,
       context->rx_endpoint_intf[ifnum]->bInterval);
 
-    rc = usb_submit_urb(context->rx_urb_intf[ifnum], GFP_ATOMIC);
+    rc = usb_submit_urb(context->rx_urb_intf[ifnum], GFP_KERNEL /*GFP_ATOMIC*/);
   }
 
   return rc;
