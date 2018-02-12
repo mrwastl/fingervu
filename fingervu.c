@@ -24,7 +24,7 @@
 #include <linux/hid.h>
 #include <linux/timer.h>
 
-#define DRIVER_VERSION "v0.3"
+#define DRIVER_VERSION "v0.4"
 #define DRIVER_AUTHOR  "Wolfgang Astleitner (mrwastl@users.sourceforge.net)"
 #define DRIVER_DESC    "SoundGraph FingerVU touch and IR/Keys/RC driver"
 #define DRIVER_NAME    "fingervu"
@@ -170,10 +170,8 @@ static const struct {
   { 0x080098d9, KEY_EJECTCD,     0 },
   /* knob/panel command: 50 XX YY 00 ... */
   /*  0500XXYY                           */
-  { 0x0500022a, KEY_VOLUMEDOWN,  1 }, /* knob left */
-  { 0x05000228, KEY_VOLUMEUP,    1 }, /* knob right */
-  { 0x0500020a, KEY_VOLUMEDOWN,  1 }, /* knob left alt */
-  { 0x05000208, KEY_VOLUMEUP,    1 }, /* knob right alt */
+  { 0x05000202, KEY_VOLUMEDOWN,  1 }, /* knob left, YY =>   0x02 */
+  { 0x05000200, KEY_VOLUMEUP,    1 }, /* knob right YY => ! 0x02*/
   { 0x05000101, KEY_MUTE,        0 }, /* knob press */
   { 0x0500010f, KEY_MEDIA,       0 }, /* panel iMedian */
   { 0x0500012b, KEY_EXIT,        0 }, /* panel app exit */
@@ -586,9 +584,14 @@ ouch event */
     }
   } else if (len == 64 && buf[0] == 0x50) { /* knob/panel */
     if (context->idev) {
-      u16 rawcode = buf[1] << 8 | buf[2];
+      u16 rawcode = (buf[1] << 8) | buf[2];
       u32 scancode = 0x05000000 | rawcode;
-      
+
+      /* knob left / right: buf[2]: ignore all bits but bit 1 (0x02) */
+      if (buf[1] == 0x02) {
+        scancode &= 0xFFFFFF02;
+      }
+
       keycode = find_keycode(scancode, &flags);
       found = (keycode != KEY_RESERVED);
     }
