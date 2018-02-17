@@ -1,7 +1,7 @@
 /*
- * FingerVU touch and IR/keys driver
+ * FingerVU touch and IR/RC/keys driver
  *
- * Copyright (C) 2013 Wolfgang Astleitner (mrwastl@users.sourceforge.net)
+ * Copyright (C) 2013-2018 Wolfgang Astleitner (mrwastl@users.sourceforge.net)
  *
  *   Heavily based on the imon.c,
  *   Copyright(C) 2010  Jarod Wilson <jarod@wilsonet.com>
@@ -23,45 +23,51 @@
 #include <linux/usb/input.h>
 #include <linux/hid.h>
 #include <linux/timer.h>
+#include <linux/version.h>
 
-#define DRIVER_VERSION "v0.5"
+#define DRIVER_VERSION "v0.6"
 #define DRIVER_AUTHOR  "Wolfgang Astleitner (mrwastl@users.sourceforge.net)"
 #define DRIVER_DESC    "SoundGraph FingerVU touch and IR/Keys/RC driver"
 #define DRIVER_NAME    "fingervu"
+
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 14, 0)
+  #define FINGERVU_NEW_TIMER_CODE 1
+#endif
 
 /* to prevent races between open() and disconnect(), probing, etc */
 static DEFINE_MUTEX(driver_lock);
 
 static bool debug = 0;
-module_param(debug, bool, 0644);
+module_param(debug, bool, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(debug, "Debug messages: 0=no, 1=yes (default: no)");
 
 static bool mirror_x = 0;
-module_param(mirror_x, bool, 0644);
+module_param(mirror_x, bool, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(mirror_x, "Mirror X axis: 0=no, 1=yes (default: no)");
 
 static bool mirror_y = 0;
-module_param(mirror_y, bool, 0644);
+module_param(mirror_y, bool, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(mirror_y, "Mirror Y axis: 0=no, 1=yes (default: no)");
 
 static bool disable_touch = 0;
-module_param(disable_touch, bool, 0644);
+module_param(disable_touch, bool, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(disable_touch, "Disable touchscreen: 0=no, 1=yes (default: no)");
 
 static bool disable_idev = 0;
-module_param(disable_idev, bool, 0644);
+module_param(disable_idev, bool, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(disable_idev, "Disable input device: 0=no, 1=yes (default: no)");
 
 static bool disable_mouse = 1;
-module_param(disable_mouse, bool, 0644);
+module_param(disable_mouse, bool, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(disable_mouse, "Disable mouse device: 0=no, 1=yes (default: no)");
 
 static unsigned int repeat_delay = 660;
-module_param(repeat_delay, uint, 0644);
+module_param(repeat_delay, uint, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(repeat_delay, "Delay after which a repeated key event will be generated (default: 660ms)");
 
 static unsigned int repeat_rate = 10;
-module_param(repeat_rate, uint, 0644);
+module_param(repeat_rate, uint, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP);
 MODULE_PARM_DESC(repeat_rate, "Max. repeats per seconds (default: 10 repeats/s)");
 
 /* table of devices that work with this driver */
@@ -431,8 +437,13 @@ static void fingervu_disconnect(struct usb_interface *interface) {
 /**
  * Callback function for touch timeout
  */
+#ifdef FINGERVU_NEW_TIMER_CODE
+static void fingervu_touch_timeout(struct timer_list *tl) {
+  struct fingervu_context *context = from_timer(context, tl, ttimer);
+#else
 static void fingervu_touch_timeout(unsigned long data) {
   struct fingervu_context *context = (struct fingervu_context *)data;
+#endif
   if (context->touch && context->touch_active) {
     context->touch_active = 0;
     input_report_abs(context->touch, ABS_X, context->touch_x);
@@ -444,8 +455,13 @@ static void fingervu_touch_timeout(unsigned long data) {
 
 
 
+#ifdef FINGERVU_NEW_TIMER_CODE
+static void fingervu_key_timeout(struct timer_list *tl) {
+  struct fingervu_context *context = from_timer(context, tl, ktimer);
+#else
 static void fingervu_key_timeout(unsigned long data) {
   struct fingervu_context *context = (struct fingervu_context *)data;
+#endif
   if (context->idev && context->key_pending != KEY_RESERVED) {
     input_report_key(context->idev, context->key_pending, 0x00);
     input_sync(context->idev);
@@ -496,9 +512,13 @@ static struct input_dev* fingervu_init_touch(struct fingervu_context *context) {
   input_set_abs_params(touch, ABS_X, 0x00, 0xffff, 0, 0);
   input_set_abs_params(touch, ABS_Y, 0x00, 0xffff, 0, 0);
 
+#ifdef FINGERVU_NEW_TIMER_CODE
+  timer_setup(&context->ttimer, fingervu_touch_timeout, 0);
+#else
   init_timer(&context->ttimer);
   context->ttimer.data = (unsigned long)context;
   context->ttimer.function = fingervu_touch_timeout;
+#endif
 
   input_set_drvdata(touch, context);
 
@@ -550,9 +570,13 @@ static struct input_dev* fingervu_init_idev(struct fingervu_context *context) {
   idev->dev.parent = context->dev;
   input_set_drvdata(idev, context);
 
+#ifdef FINGERVU_NEW_TIMER_CODE
+  timer_setup(&context->ktimer, fingervu_key_timeout, 0);
+#else
   init_timer(&context->ktimer);
   context->ktimer.data = (unsigned long)context;
   context->ktimer.function = fingervu_key_timeout;
+#endif
 
   ret = input_register_device(idev);
   if (ret < 0) {
